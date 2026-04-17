@@ -83,9 +83,10 @@ function run(command, args, options = {}) {
 
 function main() {
   const options = parseArgs(process.argv.slice(2));
+  const usingTrustedPublishing = Boolean(process.env.ACTIONS_ID_TOKEN_REQUEST_URL);
 
-  if (!options.dryRun && !process.env.NODE_AUTH_TOKEN) {
-    throw new Error("NODE_AUTH_TOKEN is required for npm publish.");
+  if (!options.dryRun && !process.env.NODE_AUTH_TOKEN && !usingTrustedPublishing) {
+    throw new Error("npm publish requires either NODE_AUTH_TOKEN or GitHub Actions OIDC trusted publishing.");
   }
 
   run("node", [path.join(repoRoot, "scripts", "npm", "build-packages.mjs"), ...options.buildArgs]);

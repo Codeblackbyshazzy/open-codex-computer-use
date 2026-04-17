@@ -1,6 +1,10 @@
 name: release
 
 on:
+  push:
+    tags:
+      - "v*"
+      - "*.*.*"
   workflow_dispatch:
     inputs:
       publish_to_npm:
@@ -16,6 +20,7 @@ on:
 
 permissions:
   contents: read
+  id-token: write
 
 jobs:
   package-npm:
@@ -44,11 +49,11 @@ jobs:
           if-no-files-found: error
 
       - name: Publish packages to npm
-        if: ${{ inputs.publish_to_npm }}
+        if: ${{ github.event_name == 'push' || inputs.publish_to_npm }}
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_DIST_TAG: ${{ github.event_name == 'push' && 'latest' || inputs.npm_tag }}
         run: |
           node ./scripts/npm/publish-packages.mjs \
             --skip-build \
             --out-dir dist/release/npm-staging \
-            --tag "${{ inputs.npm_tag }}"
+            --tag "${NPM_DIST_TAG}"
