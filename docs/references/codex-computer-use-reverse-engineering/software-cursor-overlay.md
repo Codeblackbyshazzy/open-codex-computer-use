@@ -159,6 +159,39 @@ Bounds: X=1949 Y=796 Width=126 Height=126
 
 这比直接操纵系统可见光标更稳，也更容易做出平滑路径、点击高亮和 delay 控制。
 
+## 更细一层的实现推断
+
+继续看 `ComputerUseCursor.Window` 的静态分析后，可以再补两条对开源实现很关键的推断。
+
+### 1. 官方不仅调 window level，还会绑定具体 target window id
+
+从 `ComputerUseCursor.Window` 的 ivar 和辅助函数可以看到：
+
+- 它同时保存了 `useOverlayWindowLevel` 和 `correspondingWindowID`。
+- helper `0x10005d650` 会在 `useOverlayWindowLevel` 开启时检查 `correspondingWindowID` 是否还存在于当前窗口列表里。
+- helper `0x10005d7bc` 在目标 window 仍有效时，会继续把 cursor window 排到对应 window 之上；目标失效时会清掉当前动画状态并回退到普通前置排序。
+
+这说明官方做的不是“把 overlay 永远设到某个固定 level”，而是“尽量相对某个具体 window 维持排序；一旦目标 window 消失或失效，再切回兜底行为”。
+
+### 2. 官方在生成/接受轨迹前，会做窗口命中检查
+
+`ComputerUseCursor.Window` 的大方法里出现了一组很有辨识度的名字：
+
+- `distanceThreshold`
+- `closeEnough`
+- `control1`
+- `control2`
+- `staysInBounds`
+
+对应 helper `0x10005c388` 的行为也很说明问题：
+
+- 它会读取 `correspondingWindowID`。
+- 用当前候选点坐标去做 window hit-test。
+- 把命中的 window number 和 `correspondingWindowID` 比较。
+- 只有在关键采样点仍然落在目标 window 上时，才接受这组路径/控制点。
+
+换句话说，官方那条 Bezier 不是“先固定算出来再硬播”，而是带有一层 target-window-aware 的约束判断，避免鼠标视觉轨迹明显飘出被控窗口。
+
 ## 还没完全确认的点
 
 - 还没有抓到一次动画进行中的连续窗口轨迹，目前只有离散位置点。
@@ -170,5 +203,7 @@ Bounds: X=1949 Y=796 Width=126 Height=126
 
 - 可以把“真实输入注入”和“软件光标可视化”明确拆开。
 - 软件光标可以做成独立 overlay window，而不是强依赖真实鼠标位置。
+- 如果手上有 `windowID`，Bezier 候选最好先做一轮窗口命中采样，再决定用哪组 `control1` / `control2`。
+- overlay 最好维护“相对目标 window 的排序”和“目标 window 是否还活着”的状态，而不是只在动画开始时排一次层级。
 - 事件执行即使失败，overlay 也可以保持可观测，有利于调试和用户信任。
 - 菜单栏状态项和软件光标都放在同一个 `LSUIElement` agent app 里，是一条已经被官方实现验证过的产品形态。

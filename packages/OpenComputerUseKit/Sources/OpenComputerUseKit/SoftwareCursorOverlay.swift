@@ -61,24 +61,38 @@ struct CursorMotionPath {
     let control1: CGPoint
     let control2: CGPoint
     let end: CGPoint
+    let curveScale: CGFloat
 
-    init(start: CGPoint, end: CGPoint) {
+    init(start: CGPoint, end: CGPoint, curveDirection: CGFloat? = nil, curveScale: CGFloat = 1) {
         let delta = CGVector(dx: end.x - start.x, dy: end.y - start.y)
         let distance = max(hypot(delta.dx, delta.dy), 1)
         let normal = normalized(CGVector(dx: -delta.dy, dy: delta.dx))
-        let curveDirection: CGFloat = delta.dx >= 0 ? 1 : -1
-        let curveAmount = min(max(distance * 0.22, 28), 110)
-        let controlOffset = CGPoint(x: normal.dx * curveAmount * curveDirection, y: normal.dy * curveAmount * curveDirection)
+        let resolvedCurveDirection = curveDirection ?? (delta.dx >= 0 ? 1 : -1)
+        let resolvedCurveScale = max(curveScale, 0)
+        let curveAmount = min(max(distance * 0.22, 28), 110) * resolvedCurveScale
+        let controlOffset = CGPoint(
+            x: normal.dx * curveAmount * resolvedCurveDirection,
+            y: normal.dy * curveAmount * resolvedCurveDirection
+        )
+        let control1Base = CGPoint(
+            x: start.x + (delta.dx * (resolvedCurveScale == 0 ? 1.0 / 3.0 : 0.18)),
+            y: start.y + (delta.dy * (resolvedCurveScale == 0 ? 1.0 / 3.0 : 0.10))
+        )
+        let control2Base = CGPoint(
+            x: start.x + (delta.dx * (resolvedCurveScale == 0 ? 2.0 / 3.0 : 0.80)),
+            y: start.y + (delta.dy * (resolvedCurveScale == 0 ? 2.0 / 3.0 : 0.96))
+        )
 
         self.start = start
         self.end = end
+        self.curveScale = resolvedCurveScale
         self.control1 = CGPoint(
-            x: start.x + (delta.dx * 0.18) + controlOffset.x,
-            y: start.y + (delta.dy * 0.10) + controlOffset.y
+            x: control1Base.x + controlOffset.x,
+            y: control1Base.y + controlOffset.y
         )
         self.control2 = CGPoint(
-            x: start.x + (delta.dx * 0.80) + (controlOffset.x * 0.48),
-            y: start.y + (delta.dy * 0.96) + (controlOffset.y * 0.48)
+            x: control2Base.x + (controlOffset.x * 0.48),
+            y: control2Base.y + (controlOffset.y * 0.48)
         )
     }
 
@@ -109,6 +123,17 @@ struct CursorMotionPath {
                 + (6 * omt * t * (control2.y - control1.y))
                 + (3 * t * t * (end.y - control2.y))
         )
+    }
+
+    func sampledConstraintPoints() -> [CGPoint] {
+        [
+            control1,
+            point(at: 0.28),
+            point(at: 0.5),
+            point(at: 0.72),
+            control2,
+            end,
+        ]
     }
 }
 
@@ -347,7 +372,7 @@ enum SoftwareCursorOverlay {
         placeCursor(at: startPoint, rotation: 0, clickProgress: 0)
 
         if distanceBetween(startPoint, constrainedTarget) > 2 {
-            animateMove(from: startPoint, to: constrainedTarget)
+            animateMove(from: startPoint, to: constrainedTarget, relativeTo: targetWindow)
         }
     }
 
@@ -423,27 +448,33 @@ enum SoftwareCursorOverlay {
             return
         }
 
-        let desiredLevel = NSWindow.Level(rawValue: targetWindow?.layer ?? 0)
+        let effectiveTargetWindow = targetWindow.flatMap { targetWindow in
+            isWindowPresent(targetWindow.windowID) ? targetWindow : nil
+        }
+
+        let desiredLevel = NSWindow.Level(rawValue: effectiveTargetWindow?.layer ?? 0)
         if panel.level != desiredLevel {
             panel.level = desiredLevel
         }
 
-        if activeTargetWindow != targetWindow || panel.isVisible == false {
-            if let targetWindow {
-                panel.order(.above, relativeTo: Int(targetWindow.windowID))
+        if activeTargetWindow != effectiveTargetWindow || panel.isVisible == false {
+            if let effectiveTargetWindow {
+                panel.order(.above, relativeTo: Int(effectiveTargetWindow.windowID))
             } else {
                 panel.orderFront(nil)
             }
-            activeTargetWindow = targetWindow
+            activeTargetWindow = effectiveTargetWindow
         }
     }
 
-    private static func animateMove(from start: CGPoint, to end: CGPoint) {
-        let path = CursorMotionPath(start: start, end: end)
+    private static func animateMove(from start: CGPoint, to end: CGPoint, relativeTo targetWindow: CursorTargetWindow?) {
+        let path = bestMotionPath(from: start, to: end, relativeTo: targetWindow)
         let duration = min(max(TimeInterval(distanceBetween(start, end) / 1050), 0.24), 0.56)
         let startTime = CACurrentMediaTime()
 
         while true {
+            refreshActiveOrderingIfNeeded()
+
             let elapsed = CACurrentMediaTime() - startTime
             let rawProgress = min(max(elapsed / duration, 0), 1)
             let eased = easeInOut(rawProgress)
@@ -459,6 +490,97 @@ enum SoftwareCursorOverlay {
 
             pumpFrame()
         }
+    }
+
+    private static func bestMotionPath(from start: CGPoint, to end: CGPoint, relativeTo targetWindow: CursorTargetWindow?) -> CursorMotionPath {
+        let preferredCurveDirection: CGFloat = end.x >= start.x ? 1 : -1
+        let candidates = [
+            CursorMotionPath(start: start, end: end, curveDirection: preferredCurveDirection, curveScale: 1),
+            CursorMotionPath(start: start, end: end, curveDirection: -preferredCurveDirection, curveScale: 1),
+            CursorMotionPath(start: start, end: end, curveDirection: preferredCurveDirection, curveScale: 0.72),
+            CursorMotionPath(start: start, end: end, curveDirection: -preferredCurveDirection, curveScale: 0.72),
+            CursorMotionPath(start: start, end: end, curveDirection: preferredCurveDirection, curveScale: 0.38),
+            CursorMotionPath(start: start, end: end, curveDirection: -preferredCurveDirection, curveScale: 0.38),
+            CursorMotionPath(start: start, end: end, curveDirection: 0, curveScale: 0),
+        ]
+
+        guard let targetWindow else {
+            return candidates[0]
+        }
+
+        let excludingWindowNumber = max(panel?.windowNumber ?? 0, 0)
+        let evaluations = candidates.map { candidate in
+            (
+                path: candidate,
+                hitCount: windowConstraintHitCount(
+                    for: candidate,
+                    relativeTo: targetWindow,
+                    excludingWindowNumber: excludingWindowNumber
+                )
+            )
+        }
+
+        let totalSampleCount = candidates[0].sampledConstraintPoints().count
+        let bestHitCount = evaluations.map(\.hitCount).max() ?? 0
+
+        if bestHitCount == totalSampleCount {
+            return evaluations
+                .filter { $0.hitCount == bestHitCount }
+                .max { $0.path.curveScale < $1.path.curveScale }?
+                .path ?? candidates[0]
+        }
+
+        if bestHitCount > 0 {
+            return evaluations
+                .filter { $0.hitCount == bestHitCount }
+                .min { $0.path.curveScale < $1.path.curveScale }?
+                .path ?? candidates.last ?? candidates[0]
+        }
+
+        return candidates.last ?? candidates[0]
+    }
+
+    private static func windowConstraintHitCount(
+        for path: CursorMotionPath,
+        relativeTo targetWindow: CursorTargetWindow,
+        excludingWindowNumber: Int
+    ) -> Int {
+        path.sampledConstraintPoints().reduce(into: 0) { result, point in
+            if windowID(at: point, excludingWindowNumber: excludingWindowNumber) == targetWindow.windowID {
+                result += 1
+            }
+        }
+    }
+
+    private static func windowID(at point: CGPoint, excludingWindowNumber: Int) -> CGWindowID? {
+        let windowNumber = NSWindow.windowNumber(
+            at: NSPoint(x: point.x, y: point.y),
+            belowWindowWithWindowNumber: excludingWindowNumber
+        )
+
+        guard windowNumber > 0 else {
+            return nil
+        }
+
+        return CGWindowID(windowNumber)
+    }
+
+    private static func isWindowPresent(_ windowID: CGWindowID) -> Bool {
+        guard windowID != 0,
+              let windowInfo = CGWindowListCopyWindowInfo([.optionIncludingWindow], windowID) as? [[String: Any]]
+        else {
+            return false
+        }
+
+        return !windowInfo.isEmpty
+    }
+
+    private static func refreshActiveOrderingIfNeeded() {
+        guard let activeTargetWindow, !isWindowPresent(activeTargetWindow.windowID) else {
+            return
+        }
+
+        configureOrdering(relativeTo: nil)
     }
 
     private static func animateClickPulse(at point: CGPoint, clickCount: Int, mouseButton: MouseButtonKind) {
@@ -501,6 +623,8 @@ enum SoftwareCursorOverlay {
                 guard let cursorView, let panel else {
                     return
                 }
+
+                refreshActiveOrderingIfNeeded()
 
                 idlePhase += 0.05
                 let offset = CGPoint(
