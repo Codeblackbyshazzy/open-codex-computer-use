@@ -1,0 +1,339 @@
+import CoreGraphics
+import Foundation
+
+struct MCPResponse {
+    let id: Int?
+    let result: [String: Any]?
+    let error: [String: Any]?
+}
+
+final class MCPClient {
+    private let process: Process
+    private let stdin: FileHandle
+    private let stdout: FileHandle
+    private var nextID = 1
+
+    init(executableURL: URL, arguments: [String]) throws {
+        process = Process()
+        process.executableURL = executableURL
+        process.arguments = arguments
+        let stdinPipe = Pipe()
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+        process.standardInput = stdinPipe
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
+        try process.run()
+        stdin = stdinPipe.fileHandleForWriting
+        stdout = stdoutPipe.fileHandleForReading
+    }
+
+    func initialize() throws {
+        _ = try request(method: "initialize", params: [
+            "clientInfo": [
+                "name": "OpenCodexComputerUseSmokeSuite",
+                "version": "0.1.0",
+            ],
+            "capabilities": [:],
+            "protocolVersion": "2025-03-26",
+        ])
+
+        try notify(method: "notifications/initialized", params: [:])
+    }
+
+    func listTools() throws -> [[String: Any]] {
+        let response = try request(method: "tools/list", params: [:])
+        return response.result?["tools"] as? [[String: Any]] ?? []
+    }
+
+    func callTool(_ name: String, arguments: [String: Any]) throws -> String {
+        let response = try request(method: "tools/call", params: [
+            "name": name,
+            "arguments": arguments,
+        ])
+
+        if let error = response.error {
+            throw SmokeError.message("JSON-RPC error: \(error)")
+        }
+
+        let result = response.result ?? [:]
+        if (result["isError"] as? Bool) == true {
+            let text = extractText(from: result) ?? "unknown tool error"
+            throw SmokeError.message(text)
+        }
+
+        guard let text = extractText(from: result) else {
+            throw SmokeError.message("Tool \(name) returned no text content.")
+        }
+
+        return text
+    }
+
+    func terminate() {
+        process.terminate()
+    }
+
+    private func notify(method: String, params: [String: Any]) throws {
+        let payload: [String: Any] = [
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+        ]
+        try write(payload)
+    }
+
+    private func request(method: String, params: [String: Any]) throws -> MCPResponse {
+        let id = nextID
+        nextID += 1
+
+        let payload: [String: Any] = [
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        ]
+
+        try write(payload)
+        return try readResponse(expectedID: id)
+    }
+
+    private func write(_ payload: [String: Any]) throws {
+        let data = try JSONSerialization.data(withJSONObject: payload, options: [.withoutEscapingSlashes])
+        stdin.write(data)
+        stdin.write(Data([0x0A]))
+    }
+
+    private func readResponse(expectedID: Int) throws -> MCPResponse {
+        let deadline = Date().addingTimeInterval(20)
+        var buffer = Data()
+
+        while Date() < deadline {
+            let chunk = try stdout.read(upToCount: 1) ?? Data()
+            if chunk.isEmpty {
+                Thread.sleep(forTimeInterval: 0.05)
+                continue
+            }
+
+            buffer.append(chunk)
+
+            if chunk == Data([0x0A]) {
+                let lineData = buffer.dropLast()
+                buffer.removeAll(keepingCapacity: true)
+                guard !lineData.isEmpty else {
+                    continue
+                }
+
+                let object = try JSONSerialization.jsonObject(with: lineData) as? [String: Any] ?? [:]
+                let id = object["id"] as? Int
+
+                if id != expectedID {
+                    continue
+                }
+
+                return MCPResponse(
+                    id: id,
+                    result: object["result"] as? [String: Any],
+                    error: object["error"] as? [String: Any]
+                )
+            }
+        }
+
+        throw SmokeError.message("Timed out waiting for JSON-RPC response \(expectedID)")
+    }
+
+    private func extractText(from result: [String: Any]) -> String? {
+        let content = result["content"] as? [[String: Any]]
+        return content?.first?["text"] as? String
+    }
+}
+
+enum SmokeError: Error {
+    case message(String)
+}
+
+@main
+enum OpenCodexComputerUseSmokeSuite {
+    static func main() throws {
+        let productsDirectory = try locateProductsDirectory()
+        let fixtureURL = productsDirectory.appendingPathComponent("OpenCodexComputerUseFixture")
+        let serverURL = productsDirectory.appendingPathComponent("OpenCodexComputerUse")
+
+        let fixture = Process()
+        fixture.executableURL = fixtureURL
+        fixture.standardOutput = Pipe()
+        fixture.standardError = Pipe()
+        try fixture.run()
+
+        defer {
+            fixture.terminate()
+        }
+
+        Thread.sleep(forTimeInterval: 1.5)
+
+        let client = try MCPClient(executableURL: serverURL, arguments: ["mcp"])
+        defer {
+            client.terminate()
+        }
+
+        try client.initialize()
+
+        let tools = try client.listTools()
+        guard tools.count == 9 else {
+            throw SmokeError.message("Expected 9 tools, got \(tools.count)")
+        }
+
+        let appName = "OpenCodexComputerUseFixture"
+
+        print("1. list_apps")
+        let apps = try client.callTool("list_apps", arguments: [:])
+        try expect(apps.contains(appName), "Fixture app should appear in list_apps output.")
+
+        print("2. get_app_state")
+        var state = try client.callTool("get_app_state", arguments: [
+            "app": appName,
+        ])
+        var index = parseElementIndex(state)
+        try expect(index.keys.contains("fixture-increment"), "fixture button should be indexed")
+
+        print("3. click element_index")
+        state = try client.callTool("click", arguments: [
+            "app": appName,
+            "element_index": index["fixture-increment"]!.index,
+        ])
+        try expect(state.contains("Counter: 1"), "click should increment the counter")
+
+        print("4. click coordinate")
+        index = parseElementIndex(state)
+        let buttonFrame = index["fixture-increment"]!.frame
+        state = try client.callTool("click", arguments: [
+            "app": appName,
+            "x": buttonFrame.midX,
+            "y": buttonFrame.midY,
+        ])
+        try expect(state.contains("Counter: 2"), "coordinate click should increment the counter again")
+
+        print("5. perform_secondary_action")
+        let windowIndex = index["fixture-window"]?.index ?? "0"
+        _ = try client.callTool("perform_secondary_action", arguments: [
+            "app": appName,
+            "element_index": windowIndex,
+            "action": "Raise",
+        ])
+
+        print("6. set_value")
+        state = try client.callTool("set_value", arguments: [
+            "app": appName,
+            "element_index": index["fixture-input"]!.index,
+            "value": "set-value-ok",
+        ])
+        try expect(state.contains("set-value-ok"), "set_value should update the text field")
+
+        print("7. type_text")
+        let inputFrame = index["fixture-input"]!.frame
+        _ = try client.callTool("click", arguments: [
+            "app": appName,
+            "x": inputFrame.midX,
+            "y": inputFrame.midY,
+        ])
+        state = try client.callTool("type_text", arguments: [
+            "app": appName,
+            "text": "-typed",
+        ])
+        try expect(state.contains("set-value-ok-typed"), "type_text should append literal text to the focused text field")
+
+        print("8. press_key")
+        index = parseElementIndex(state)
+        let keyCaptureFrame = index["fixture-key-capture"]!.frame
+        _ = try client.callTool("click", arguments: [
+            "app": appName,
+            "x": keyCaptureFrame.midX,
+            "y": keyCaptureFrame.midY,
+        ])
+        state = try client.callTool("press_key", arguments: [
+            "app": appName,
+            "key": "Return",
+        ])
+        try expect(state.contains("Last key: Return"), "press_key should update the key capture view")
+
+        print("9. scroll")
+        index = parseElementIndex(state)
+        let scrollIndex = index["fixture-scroll-view"]!.index
+        state = try client.callTool("scroll", arguments: [
+            "app": appName,
+            "direction": "down",
+            "element_index": scrollIndex,
+            "pages": 1,
+        ])
+        try expect(!state.contains("Scroll offset: 0"), "scroll should move the scroll view")
+
+        print("10. drag")
+        index = parseElementIndex(state)
+        let dragFrame = index["fixture-drag-pad"]!.frame
+        state = try client.callTool("drag", arguments: [
+            "app": appName,
+            "from_x": dragFrame.minX + 30,
+            "from_y": dragFrame.minY + 30,
+            "to_x": dragFrame.maxX - 30,
+            "to_y": dragFrame.maxY - 30,
+        ])
+        try expect(state.contains("Last drag:"), "drag should update the drag status label")
+        try expect(!state.contains("Last drag: none"), "drag should report a captured path")
+
+        print("Smoke suite completed.")
+    }
+
+    private static func locateProductsDirectory() throws -> URL {
+        let executableURL = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath()
+        return executableURL.deletingLastPathComponent()
+    }
+
+    private static func expect(_ condition: @autoclosure () -> Bool, _ message: String) throws {
+        guard condition() else {
+            throw SmokeError.message(message)
+        }
+    }
+
+    private static func parseElementIndex(_ state: String) -> [String: (index: String, frame: CGRect)] {
+        guard let start = state.range(of: "<element_index>"), let end = state.range(of: "</element_index>") else {
+            return [:]
+        }
+
+        let block = state[start.upperBound..<end.lowerBound]
+        var result: [String: (String, CGRect)] = [:]
+
+        for rawLine in block.split(separator: "\n") {
+            let line = String(rawLine)
+            let parts = line.components(separatedBy: " -> ")
+            guard parts.count == 2 else {
+                continue
+            }
+
+            let identifier = parts[0]
+            let remainder = parts[1]
+            let chunks = remainder.components(separatedBy: " @ ")
+            guard chunks.count == 2 else {
+                continue
+            }
+
+            let index = chunks[0]
+            let frame = parseFrame(chunks[1])
+            result[identifier] = (index, frame)
+        }
+
+        return result
+    }
+
+    private static func parseFrame(_ text: String) -> CGRect {
+        let values = text
+            .components(separatedBy: ",")
+            .compactMap { part -> Double? in
+                part.split(separator: "=").last.flatMap { Double($0.trimmingCharacters(in: .whitespaces)) }
+            }
+
+        guard values.count == 4 else {
+            return .zero
+        }
+
+        return CGRect(x: values[0], y: values[1], width: values[2], height: values[3])
+    }
+}

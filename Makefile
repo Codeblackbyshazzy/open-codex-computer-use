@@ -1,11 +1,23 @@
 PROJECT ?=
 SLUG ?=
 
-.PHONY: init check-docs check-repo ci release-package new-history new-plan
+.PHONY: init build app test smoke check-docs check-repo ci release-package new-history new-plan
 
 init:
 	@if [ -z "$(PROJECT)" ]; then echo "用法: make init PROJECT=项目名"; exit 1; fi
 	./scripts/init-project.sh "$(PROJECT)"
+
+build:
+	swift build
+
+app:
+	./scripts/build-open-codex-app.sh debug
+
+test:
+	swift test
+
+smoke:
+	./scripts/run-tool-smoke-tests.sh
 
 check-docs:
 	./scripts/check-docs.sh
